@@ -10,6 +10,14 @@ docker compose up --build
 
 启动过程会自动完成依赖安装（镜像构建时）与 SQLite 数据库初始化（服务启动时建表），无需任何手工迁移。
 
+不想使用 compose 时，也可以用单条命令构建镜像并直接启动容器（数据写入容器内 `/data`，删除容器即清除；加 `-v mspc-data:/data` 可持久化）：
+
+```bash
+docker run --rm -p 8000:8000 $(docker build -q .)
+```
+
+服务启动后，质量轴校准接口即位于 `http://localhost:8000/api/v1/mass-calibrate`（Swagger 文档：`http://localhost:8000/docs`）。
+
 ## 访问地址
 
 | 地址 | 说明 |
@@ -547,6 +555,101 @@ curl -X POST http://localhost:8000/api/v1/formula-search \
                    {"symbol":"O","min_count":0,"max_count":8}]}'
 ```
 
+### `POST /api/v1/mass-calibrate`
+
+**质量轴校准**：接收 **3～200 个校准点**（每点给出观测到的单同位素 m/z `observed_mz`，以及对应参比离子的中性 `formula`、`adduct`、`charge`）、ppm 容差 `tolerance_ppm` 和一批待校正 m/z。每个校准点的**理论单同位素 m/z** 复用 `/api/v1/ion-envelope` 的现有规则：先解析分子式、施加加合物，再按电子质量规则换算
+
+```
+理论 m/z = (单同位素质量(加合后组成) − charge × 0.000548579909065 Da) / |charge|
+```
+
+随后按"理论 m/z（x）→ 观测 m/z（y）"拟合仿射直线 `y = slope·x + intercept`：
+
+1. **稳健初模**：枚举所有理论 m/z 不相同的有效点对，每对点定义一个斜率与该直线的截距；初模斜率取**所有点对斜率的中位数**，初模截距取**对应点对截距的中位数**。
+2. **内点筛选**：计算每个有效点相对初模的残差 ppm = `(观测 − 初模预测) / 理论 × 10⁶`，残差绝对值 **≤ `tolerance_ppm`（闭区间）** 的点记为内点。
+3. **最小二乘**：对全部内点做一次普通最小二乘直线拟合，得到最终 `slope`/`intercept`。
+4. **逆变换**：对待校正 m/z 返回 `calibrated_mz = (mz − intercept) / slope`。
+
+响应同时返回每个校准点相对**最终模型**的残差（Da 与 ppm）以及该点的内点（`inlier: true`）/外点（`false`）标记（标记由初模筛选决定），**各点严格保持输入顺序**；分子式/加合物解析失败的点以 `valid: false` 附在对应位置（带既有 `error`/`message`），不影响其他点与整体拟合。
+
+请求地址：`http://localhost:8000/api/v1/mass-calibrate`
+
+请求体：
+
+```json
+{
+  "calibration_points": [
+    {"observed_mz": 33.033492, "formula": "CH4O", "adduct": "+H", "charge": 1},
+    {"observed_mz": 47.049142, "formula": "C2H6O", "adduct": "+H", "charge": 1},
+    {"observed_mz": 181.070756, "formula": "C6H12O6", "adduct": "+H", "charge": 1},
+    {"observed_mz": 179.055184, "formula": "C6H12O6", "adduct": "-H", "charge": -1},
+    {"observed_mz": 136.061821, "formula": "C5H5N5", "adduct": "+H", "charge": 1}
+  ],
+  "tolerance_ppm": 5.0,
+  "mz": [181.071, 91.039]
+}
+```
+
+- `calibration_points`（必填，**3～200 个**）：每项含 `observed_mz`（>0 的有限数）、`formula`（规则同 `/api/v1/ion-envelope`，可含 `[13C]` 等标记）、`adduct`（与 `/api/v1/ion-envelope` 完全相同的 `+/-[系数]片段` 语法）、`charge`（**-10～-1 或 1～10**，不允许 0）。
+- `tolerance_ppm`（必填，>0）：初模选内点的绝对残差容差（ppm，闭区间）。
+- `mz`（必填，**1～200 个**正值）：待校正观测 m/z 列表；也接受别名 `mzs` 或 `mz_values`。结果与输入一一对应、保持顺序。
+
+响应：
+
+```json
+{
+  "tolerance_ppm": 5.0,
+  "slope": 1.0000005,
+  "intercept": -0.000123,
+  "calibration_point_count": 5,
+  "valid_point_count": 5,
+  "inlier_count": 5,
+  "calibration_points": [
+    {
+      "index": 0,
+      "valid": true,
+      "observed_mz": 33.033492,
+      "formula": "CH4O",
+      "adduct": "+H",
+      "charge": 1,
+      "theoretical_mz": 33.033491,
+      "residual_mz": 0.0000003,
+      "residual_ppm": 0.009,
+      "inlier": true,
+      "error": null,
+      "message": null
+    }
+  ],
+  "calibrated_mz": [
+    {"mz": 181.071, "calibrated_mz": 181.070882},
+    {"mz": 91.039, "calibrated_mz": 91.038942}
+  ]
+}
+```
+
+- `slope` / `intercept`：内点最小二乘得到的最终仿射模型（观测 = slope × 理论 + intercept）。
+- `valid_point_count`：成功解析并参与拟合的点数；`inlier_count`：初模容差内的内点数（最小二乘只用这些点）。
+- `calibration_points`：**按输入顺序**返回各点；`index` 为 0 基输入索引，`theoretical_mz` 为理论单同位素 m/z，`residual_mz`/`residual_ppm` 为相对**最终模型**的残差（观测 − 模型预测；ppm 以理论 m/z 为分母），`inlier` 为初模筛选标记。解析失败的点 `valid: false`、理论/残差/标记字段为 `null`，并带 `error`（`invalid_formula` 或 `invalid_adduct`）与 `message`。
+- `calibrated_mz`：与请求 `mz` 顺序一致，每项回显原 `mz` 并给出逆变换后的 `calibrated_mz`。
+
+以下情形返回 **422**（不返回任何校准结果）：
+
+- 有效点为空（所有点分子式/加合物均解析失败）：`error` 为 `no_valid_points`；
+- 所有有效点的理论 m/z 相同、无法形成点对：`error` 为 `no_valid_point_pairs`；
+- 内点少于 3 个：`error` 为 `too_few_inliers`（信息中含内点数与 `tolerance_ppm`，可放宽容差或替换异常点后重试）；
+- 最小二乘斜率非正（≤ 0，逆变换无定义）：`error` 为 `non_positive_slope`。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/mass-calibrate \
+  -H 'Content-Type: application/json' \
+  -d '{"tolerance_ppm":5.0,
+       "calibration_points":[
+         {"observed_mz":33.033492,"formula":"CH4O","adduct":"+H","charge":1},
+         {"observed_mz":47.049142,"formula":"C2H6O","adduct":"+H","charge":1},
+         {"observed_mz":181.070756,"formula":"C6H12O6","adduct":"+H","charge":1}],
+       "mz":[181.071]}'
+```
+
 ### `POST /api/v1/enrichment-fit`
 
 估计分子中单个同位素标记的丰度（富集度）：在 0%～100% 范围内按给定步长网格搜索候选丰度，对每个候选值复用卷积生成归一化包络，与观测峰配对比较，返回均方误差最小的丰度。
@@ -725,6 +828,7 @@ curl -X POST http://localhost:8000/api/v1/formula-search \
 - `zero_profile`：`/api/v1/profile-centroid` 的轮廓强度全部为零（至少需要一个正强度点）；`field` 为 `profile`。
 - `no_candidates`：`/api/v1/profile-centroid` 阈值过滤后不存在任何平顶局部极大候选；`field` 为 `relative_threshold`。
 - `search_limit_exceeded`：`/api/v1/formula-search` 的分支限界枚举访问节点超过 100 万（随附 `visited_nodes`、`pruned_branches` 与 `limit`）；收窄元素计数范围或质量容差后重试。
+- `no_valid_points` / `no_valid_point_pairs` / `too_few_inliers` / `non_positive_slope`：`/api/v1/mass-calibrate` 的拟合级失败——有效校准点为空、有效点理论 m/z 全相同无法成对点对、初模内点少于 3 个、最终最小二乘斜率非正，均返回 422 且 `detail.message` 说明原因（内点不足时含实际内点数与 `tolerance_ppm`）。注意：**单个**校准点的分子式/加合物非法不是请求失败，该点以 `valid: false`、`error` 为 `invalid_formula`/`invalid_adduct` 出现在 200 响应中。
 
   ```json
   {
@@ -772,6 +876,7 @@ pytest                                 # 运行测试
 - **轮廓质心化**：`POST /api/v1/profile-centroid`（`app/centroid.py`）先校验 3～20000 点严格递增、等间距（各间距与首个间距相对误差 ≤ 1e-6）、非负且至少一个正强度；按基峰归一化后丢弃 `relative_threshold` 以下点（比较含微小浮点容差），将连续等强且两侧严格更低的游程识别为平顶局部极大（位置取平台两端质量中点），候选按归一化强度降序（同强度低质量优先）做 `min_separation` 非极大值抑制（恰等间距保留），再用二分最近邻把每个阈值以上点分配给最近保留候选（等距归低质量候选），以**原始强度**做强度加权得到质心质量、峰顶归一化强度（平台高度）与占总分配强度百分比，按质量升序返回；非法网格、全零轮廓或无候选返回带 `field`/`index` 的 422。
 - **离子识别**：`POST /api/v1/ion-identify`（`app/identify.py`）对 1～20 个候选（加合物, 电荷）逐个复用同一套加合物解析、离子包络计算与基峰归一化，观测峰同样归一化一次后复用；每个候选用与富集拟合相同的 `pair_and_score` 做容差内质量差全局从小到大的一对一贪心匹配，未匹配峰以零强度计入归一化 MSE。有效候选按 MSE 升序、输入索引作稳定平局键排序；非法候选捕获既有 `AdductError`（携带位置）后以 `valid: false` 附在结果末尾，不影响其他候选评分。
 - **离子混合拟合**：`POST /api/v1/ion-mixture-fit`（`app/mixture.py`）对 2～10 个候选中的每个有效候选复用 `app/identify.py` 的基峰归一化离子包络；枚举无序候选对（按请求索引升序，索引较小者为第一候选）与 0～100% 的第一候选比例网格（复用富集拟合的 `abundance_grid`，100% 端点始终包含），将两个归一化包络按比例加权叠加——两包络间 `mass_tolerance` 内的峰按强度加权质量融合、强度求和（复用 `merge_peaks`；比例为 0%/100% 时跳过另一侧，即纯包络）——混合谱再次基峰归一化后与观测峰做同一套 `pair_and_score` 一对一配对，双侧未匹配峰以零强度计入 MSE。全部组合按 (MSE, 候选索引对, 第一候选比例) 升序排名，首名即最佳组合（平局依次取较小索引对、较低首候选比例）；非法候选以 `valid: false` 返回既有位置错误并跳过其所有组合，有效候选少于两个时组合列表为空、最佳组合为 `null`。
+- **质量轴校准**：`POST /api/v1/mass-calibrate`（`app/calibration.py`）对 3～200 个校准点复用 `app/parser.py`、`app/adduct.py` 与电子质量规则 `(mass − charge·mₑ)/|charge|` 计算理论单同位素 m/z，解析失败的点按既有 `invalid_formula`/`invalid_adduct` 错误在结果中原位标记并剔除。对全部有效点枚举理论 m/z 不同的点对，斜率取点对斜率中位数、截距取点对截距中位数构成稳健初模（Theil–Sen 式）；以初模残差绝对 ppm ≤ `tolerance_ppm`（闭区间，含 1e-9 ppm 浮点保护）选内点，再对内点做一次普通最小二乘拟合。有效点为空、无不同理论 m/z 的点对、内点少于 3 个或最小二乘斜率非正时抛 `CalibrationError` 转 422。响应按输入顺序返回每点的最终模型残差（Da/ppm）与内点标记，并用逆变换 `(mz − intercept)/slope` 顺序返回待校正 m/z。
 - **单同位素质量**：按 IUPAC 惯例取各元素天然丰度最高的同位素质量之和。
 - **富集拟合**：对每个候选丰度 p（0%～100% 按步长网格搜索），将被标记元素的同位素分布替换为"标记同位素占 p、其余天然同位素按比例分享 1−p"，复用同一套卷积生成归一化包络（基峰=100，观测峰同样归一化）；观测峰与容差内最近的预测峰贪心配对，未匹配峰强度按 0 计，以全部配对的强度均方误差最小者为最佳丰度，同分取较低丰度。除被拟合元素外其余元素的包络与候选丰度无关，只计算一次。
 - **双元素联合拟合**：`POST /api/v1/dual-enrichment-fit` 在两个不同元素标签的丰度上做二维网格搜索，组合两种富集分布后沿用同一套卷积、一对一配对与含未匹配峰的 MSE。与两个候选丰度都无关的"其余元素包络"只卷积一次并在全网格复用；第一元素的富集多项式在其外层丰度固定时只计算一次。MSE 相同按两项丰度（请求顺序）升序字典序取解，`search_points` 为两网格点数之积。

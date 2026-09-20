@@ -9,10 +9,18 @@ from fastapi import FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from . import __version__, db
 from .adduct import AdductError, apply_adduct, parse_adduct
+from .calibration import (
+    MAX_POINTS as CALIBRATION_MAX_POINTS,
+    MIN_POINTS as CALIBRATION_MIN_POINTS,
+    CalibrationError,
+    CalibrationPoint,
+    calibrate_mass_axis,
+    inverse_predict,
+)
 from .centroid import CentroidError, centroid_profile
 from .config import settings
 from .enrichment import (
@@ -64,9 +72,11 @@ app = FastAPI(
         "different elements on a 2-D abundance grid, fits pairwise "
         "0-100% mixtures of candidate adduct/charge ion envelopes, "
         "simulates Gaussian instrument profiles of neutral stick spectra, "
-        "centroids equally-spaced continuous mass/intensity profiles, and "
+        "centroids equally-spaced continuous mass/intensity profiles, "
         "reverse-searches molecular formulas from a target monoisotopic "
-        "mass and observed isotope peaks via branch-and-bound enumeration."
+        "mass and observed isotope peaks via branch-and-bound enumeration, "
+        "and calibrates the mass axis with a robust median-slope initial "
+        "model followed by an inlier least-squares line."
     ),
     lifespan=lifespan,
 )
@@ -735,6 +745,175 @@ class FormulaSearchResponse(BaseModel):
         ..., description="Number of within-tolerance compositions found"
     )
     candidates: list[FormulaSearchCandidateOut]
+
+
+class MassCalibrationPoint(BaseModel):
+    observed_mz: float = Field(
+        ...,
+        gt=0,
+        description="Observed monoisotopic m/z of this reference ion",
+        examples=[181.070665],
+    )
+    formula: str = Field(
+        ...,
+        description="Neutral molecular formula of the reference ion, e.g. 'C6H12O6'",
+        examples=["C6H12O6"],
+    )
+    adduct: str = Field(
+        ...,
+        description=(
+            "Adduct made of consecutive '+/-[coefficient]formula' fragments; "
+            "the same grammar as /api/v1/ion-envelope, e.g. '+H' or '+Na-H'"
+        ),
+        examples=["+H"],
+    )
+    charge: int = Field(
+        ...,
+        ge=-10,
+        le=10,
+        description="Signed ion charge; must be -10..-1 or 1..10 (zero is not allowed)",
+        examples=[1],
+    )
+
+    @field_validator("charge")
+    @classmethod
+    def charge_must_be_nonzero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("charge must be non-zero: use -10..-1 or 1..10")
+        return value
+
+    @field_validator("observed_mz")
+    @classmethod
+    def value_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("observed_mz must be a finite number")
+        return value
+
+
+class MassCalibrateRequest(BaseModel):
+    calibration_points: list[MassCalibrationPoint] = Field(
+        ...,
+        min_length=CALIBRATION_MIN_POINTS,
+        max_length=CALIBRATION_MAX_POINTS,
+        description=(
+            f"{CALIBRATION_MIN_POINTS}-{CALIBRATION_MAX_POINTS} reference "
+            "calibration points, each pairing an observed monoisotopic m/z "
+            "with the reference ion's neutral formula, adduct and charge"
+        ),
+    )
+    tolerance_ppm: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "Absolute residual tolerance in ppm for the robust initial model "
+            "when selecting inliers"
+        ),
+        examples=[5.0],
+    )
+    mz: list[float] = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        validation_alias=AliasChoices("mz", "mzs", "mz_values"),
+        serialization_alias="mz",
+        description=(
+            "Observed m/z values to calibrate with the fitted inverse "
+            "transform, 1-200 finite positive values (also accepted as "
+            "'mzs' or 'mz_values')"
+        ),
+        examples=[[181.071, 91.039]],
+    )
+
+    @field_validator("tolerance_ppm")
+    @classmethod
+    def tolerance_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("tolerance_ppm must be a finite number")
+        return value
+
+    @field_validator("mz")
+    @classmethod
+    def mz_values_must_be_finite_and_positive(cls, value: list[float]) -> list[float]:
+        for item in value:
+            if not math.isfinite(item):
+                raise ValueError("each mz value must be a finite number")
+            if item <= 0:
+                raise ValueError("each mz value must be positive")
+        return value
+
+
+class MassCalibrationPointOut(BaseModel):
+    index: int = Field(
+        ..., description="0-based position of the calibration point in the request"
+    )
+    valid: bool
+    observed_mz: float
+    formula: str
+    adduct: str
+    charge: int
+    theoretical_mz: float | None = Field(
+        None,
+        description="Theoretical monoisotopic m/z computed from formula/adduct/charge "
+        "(null for points that fail to parse)",
+    )
+    residual_mz: float | None = Field(
+        None, description="Final-model residual: observed - (slope * theoretical + intercept) Da"
+    )
+    residual_ppm: float | None = Field(
+        None, description="Final-model residual relative to the theoretical m/z, in ppm"
+    )
+    inlier: bool | None = Field(
+        None,
+        description=(
+            "Whether the point is an inlier of the robust initial model "
+            "(null for points that fail to parse)"
+        ),
+    )
+    error: str | None = Field(
+        None, description="Machine-readable error code for invalid points"
+    )
+    message: str | None = Field(
+        None, description="Human-readable reason why the point is invalid"
+    )
+
+
+class CalibratedMzOut(BaseModel):
+    mz: float = Field(..., description="Observed m/z submitted for calibration")
+    calibrated_mz: float = Field(
+        ..., description="m/z after applying the fitted inverse transform"
+    )
+
+
+class MassCalibrateResponse(BaseModel):
+    tolerance_ppm: float
+    slope: float = Field(
+        ..., description="Final least-squares slope of observed = slope * theoretical + intercept"
+    )
+    intercept: float = Field(..., description="Final least-squares intercept (Da)")
+    calibration_point_count: int
+    valid_point_count: int
+    inlier_count: int
+    calibration_points: list[MassCalibrationPointOut] = Field(
+        ..., description="Per-point residuals and inlier flags, kept in request order"
+    )
+    calibrated_mz: list[CalibratedMzOut] = Field(
+        ..., description="Calibrated m/z values, kept in request order"
+    )
+
+
+@app.exception_handler(CalibrationError)
+async def calibration_error_handler(
+    request: Request, exc: CalibrationError
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": exc.error,
+                "message": exc.message,
+            }
+        },
+    )
 
 
 @app.exception_handler(FormulaError)
@@ -1495,4 +1674,92 @@ def formula_search(req: FormulaSearchRequest) -> dict:
         "pruned_branches": result.pruned_branches,
         "total_hits": result.total_hits,
         "candidates": candidates,
+    }
+
+
+@app.post("/api/v1/mass-calibrate", response_model=MassCalibrateResponse)
+def mass_calibrate(req: MassCalibrateRequest) -> dict:
+    """Calibrate the mass axis from reference calibration points.
+
+    Each of the 3-200 calibration points pairs an observed monoisotopic m/z
+    with the reference ion's neutral formula, adduct and signed charge; the
+    theoretical monoisotopic m/z reuses the existing formula parser, adduct
+    application and the ``(mass - charge * m_e) / |charge|`` electron-mass
+    rule of ``/api/v1/ion-envelope``. Points that fail formula/adduct
+    parsing are reported in place (with the same position-aware errors) and
+    excluded from the fit. An initial affine model (observed vs.
+    theoretical) is built from the median slope and median intercept of all
+    valid point pairs; points whose absolute residual against it is at most
+    ``tolerance_ppm`` are inliers, and one ordinary least-squares line is
+    fitted to them. The final slope, intercept, every point's residual and
+    inlier flag are returned in request order, together with the requested
+    m/z values mapped through the inverse transform. No valid points, no
+    distinct-theoretical-m/z pair, fewer than three inliers or a
+    non-positive fitted slope answer 422.
+    """
+    points = [
+        CalibrationPoint(
+            index=idx,
+            observed_mz=p.observed_mz,
+            formula=p.formula,
+            adduct=p.adduct,
+            charge=p.charge,
+        )
+        for idx, p in enumerate(req.calibration_points)
+    ]
+    try:
+        fit = calibrate_mass_axis(points, req.tolerance_ppm)
+    except CalibrationError as exc:
+        db.log_request(
+            f"mass-calibrate:{len(points)}-points", None, ok=False, message=exc.message
+        )
+        raise
+
+    calibrated = [
+        {"mz": mz, "calibrated_mz": round(inverse_predict(fit, mz), 6)}
+        for mz in req.mz
+    ]
+    point_out = [
+        {
+            "index": p.index,
+            "valid": p.valid,
+            "observed_mz": round(p.observed_mz, 6),
+            "formula": p.formula,
+            "adduct": p.adduct,
+            "charge": p.charge,
+            "theoretical_mz": round(p.theoretical_mz, 6)
+            if p.theoretical_mz is not None
+            else None,
+            "residual_mz": round(p.residual_mz, 9)
+            if p.residual_mz is not None
+            else None,
+            "residual_ppm": round(p.residual_ppm, 6)
+            if p.residual_ppm is not None
+            else None,
+            "inlier": p.inlier,
+            "error": p.error,
+            "message": p.message,
+        }
+        for p in fit.points
+    ]
+
+    db.log_request(
+        f"mass-calibrate:{len(points)}-points",
+        None,
+        ok=True,
+        message=(
+            f"mass calibration: {fit.valid_point_count} valid, "
+            f"{fit.inlier_count} inliers, slope={fit.slope:.9g}, "
+            f"intercept={fit.intercept:.9g}"
+        ),
+    )
+    return {
+        "tolerance_ppm": req.tolerance_ppm,
+        "slope": round(fit.slope, 9),
+        "intercept": round(fit.intercept, 9),
+        "calibration_point_count": len(points),
+        "valid_point_count": fit.valid_point_count,
+        "inlier_count": fit.inlier_count,
+        "calibration_points": point_out,
+        "calibrated_mz": calibrated,
     }
