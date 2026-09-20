@@ -10,6 +10,12 @@ docker compose up --build
 
 启动过程会自动完成依赖安装（镜像构建时）与 SQLite 数据库初始化（服务启动时建表），无需任何手工迁移。
 
+不想挂载命名卷时也可用单条 `docker` 命令直接启动（镜像构建 + 前台运行一条龙）：
+
+```bash
+docker run --rm -p 8000:8000 "$(docker build -q .)"
+```
+
 ## 访问地址
 
 | 地址 | 说明 |
@@ -17,6 +23,7 @@ docker compose up --build
 | http://localhost:8000 | 服务根地址（端口 8000） |
 | http://localhost:8000/docs | Swagger 交互式文档 |
 | http://localhost:8000/health | 健康检查 |
+| http://localhost:8000/api/v1/mass-calibrate | 质量轴校准（POST） |
 
 ## API 用法
 
@@ -547,6 +554,94 @@ curl -X POST http://localhost:8000/api/v1/formula-search \
                    {"symbol":"O","min_count":0,"max_count":8}]}'
 ```
 
+### `POST /api/v1/mass-calibrate`
+
+**质量轴校准**：客户端提交 **3～200 个校准点**，每个校准点给出一个观测 m/z 以及该离子的 `formula`、`adduct`、`charge`；服务复用现有分子式解析、加合物规则与电子质量规则（与 `/api/v1/ion-envelope` 完全一致的 `(mass − charge·mₑ)/|charge|`，`mₑ = 0.000548579909065 Da`）计算理论单同位素 m/z，并把观测质量轴拟合为理论 m/z 的线性函数：
+
+```
+observed = slope × theoretical + intercept
+```
+
+请求体：
+
+```json
+{
+  "calibration_points": [
+    {"observed_mz": 19.0213, "formula": "H2O",       "adduct": "+H",   "charge": 1},
+    {"observed_mz": 33.0396, "formula": "CH4O",      "adduct": "+H",   "charge": 1},
+    {"observed_mz": 47.0581, "formula": "C2H6O",     "adduct": "+H",   "charge": 1},
+    {"observed_mz": 61.0766, "formula": "C3H8O",     "adduct": "+H",   "charge": 1},
+    {"observed_mz": 203.0926, "formula": "C6H12O6",  "adduct": "+Na",  "charge": 1}
+  ],
+  "tolerance_ppm": 100.0,
+  "mz": [47.0581, 100.0]
+}
+```
+
+- `calibration_points`（必填，**3～200 个**，结果顺序与输入一致）：
+  - `observed_mz`（必填，>0 的有限数）：校准离子的观测 m/z。
+  - `formula` / `adduct` / `charge`：中性分子式、加合物与带符号电荷，语法与校验规则同 `/api/v1/ion-envelope`（`charge` 为 -10～-1 或 1～10，不允许 0）。**单个点分子式或加合物非法时该点标记为无效点随 200 返回**（携带 `invalid_formula`/`invalid_adduct`、`message` 与 `position`），不会导致整个请求失败。
+- `tolerance_ppm`（必填，>0 的有限数）：初模内点判定容差（ppm）。
+- `mz`（必填，**1～10000 个** >0 的有限数）：待校正的观测 m/z，结果按输入顺序返回。
+
+拟合流程：
+
+1. **初模（中位数直线）**：任取两个理论 m/z 不同的有效点计算斜率 `(yⱼ − yᵢ)/(xⱼ − xᵢ)`，取所有点对斜率的**中位数**作为初始斜率；再对每个有效点计算截距 `y − slope0·x`，取截距的**中位数**作为初始截距。
+2. **内点筛选**：逐点计算相对初模的残差 `y − (slope0·x + intercept0)`，其绝对值换算为 ppm（除以预测 m/z）后 **不超过 `tolerance_ppm`**（闭区间）的点为内点。
+3. **最小二乘精修**：对内点做一次普通最小二乘直线拟合（`slope = Sxy/Sxx`，`intercept = ȳ − slope·x̄`），得到最终 `slope`/`intercept`。
+4. **逆变换校正**：待校正 m/z 用最终直线的逆映射返回：`calibrated = (mz − intercept) / slope`。
+
+响应：
+
+```json
+{
+  "tolerance_ppm": 100.0,
+  "valid_point_count": 5,
+  "inlier_count": 5,
+  "slope": 1.000199,
+  "intercept": -0.000377,
+  "calibration_points": [
+    {
+      "index": 0,
+      "observed_mz": 19.0213,
+      "formula": "H2O",
+      "adduct": "+H",
+      "charge": 1,
+      "valid": true,
+      "theoretical_mz": 19.017841,
+      "residual_ppm": 2.905457,
+      "inlier": true,
+      "error": null,
+      "message": null,
+      "position": null
+    }
+  ],
+  "mz": [47.0581, 100.0],
+  "calibrated_mz": [47.049123, 99.9805]
+}
+```
+
+- `slope` / `intercept`：内点最小二乘精修后的最终直线参数（理论 m/z → 观测 m/z）。
+- `valid_point_count` / `inlier_count`：有效点数与参与最小二乘的内点数。
+- `calibration_points`：**严格保持请求顺序**的逐点结果。`theoretical_mz` 为复用离子规则算出的理论单同位素 m/z（无效点为 `null`）；`inlier` 表示该点是否在初模 `tolerance_ppm` 内并参与了最小二乘；`residual_ppm` 为该点相对**最终拟合直线**的残差（观测 − 预测，单位 ppm，无效点为 `null`）；无效点另带 `error`/`message`/`position`，`valid` 为 `false`。
+- `mz` / `calibrated_mz`：待校正 m/z 原样回显（输入顺序）及逆变换校正结果（同序）。
+
+以下情形返回 422（请求级 `detail.error`）：
+
+- `no_valid_pairs`：不存在理论 m/z 不同的有效点对（所有点都非法，或有效点的理论 m/z 全部相同）。
+- `insufficient_inliers`：内点少于 **3** 个。
+- `non_positive_slope`：初始斜率中位数非正，或最小二乘拟合斜率非正（观测 m/z 必须随理论 m/z 递增）。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/mass-calibrate \
+  -H 'Content-Type: application/json' \
+  -d '{"tolerance_ppm":100.0,"mz":[47.0581],
+       "calibration_points":[
+         {"observed_mz":19.0213,"formula":"H2O","adduct":"+H","charge":1},
+         {"observed_mz":47.0581,"formula":"C2H6O","adduct":"+H","charge":1},
+         {"observed_mz":203.0926,"formula":"C6H12O6","adduct":"+Na","charge":1}]}'
+```
+
 ### `POST /api/v1/enrichment-fit`
 
 估计分子中单个同位素标记的丰度（富集度）：在 0%～100% 范围内按给定步长网格搜索候选丰度，对每个候选值复用卷积生成归一化包络，与观测峰配对比较，返回均方误差最小的丰度。
@@ -725,6 +820,9 @@ curl -X POST http://localhost:8000/api/v1/formula-search \
 - `zero_profile`：`/api/v1/profile-centroid` 的轮廓强度全部为零（至少需要一个正强度点）；`field` 为 `profile`。
 - `no_candidates`：`/api/v1/profile-centroid` 阈值过滤后不存在任何平顶局部极大候选；`field` 为 `relative_threshold`。
 - `search_limit_exceeded`：`/api/v1/formula-search` 的分支限界枚举访问节点超过 100 万（随附 `visited_nodes`、`pruned_branches` 与 `limit`）；收窄元素计数范围或质量容差后重试。
+- `no_valid_pairs`：`/api/v1/mass-calibrate` 中不存在理论 m/z 不同的有效校准点对（所有点分子式/加合物非法，或有效点理论 m/z 全相同）。
+- `insufficient_inliers`：`/api/v1/mass-calibrate` 按 `tolerance_ppm` 筛选后的内点少于 3 个。
+- `non_positive_slope`：`/api/v1/mass-calibrate` 的初始中位数斜率或最小二乘精修斜率非正。
 
   ```json
   {
@@ -776,5 +874,6 @@ pytest                                 # 运行测试
 - **富集拟合**：对每个候选丰度 p（0%～100% 按步长网格搜索），将被标记元素的同位素分布替换为"标记同位素占 p、其余天然同位素按比例分享 1−p"，复用同一套卷积生成归一化包络（基峰=100，观测峰同样归一化）；观测峰与容差内最近的预测峰贪心配对，未匹配峰强度按 0 计，以全部配对的强度均方误差最小者为最佳丰度，同分取较低丰度。除被拟合元素外其余元素的包络与候选丰度无关，只计算一次。
 - **双元素联合拟合**：`POST /api/v1/dual-enrichment-fit` 在两个不同元素标签的丰度上做二维网格搜索，组合两种富集分布后沿用同一套卷积、一对一配对与含未匹配峰的 MSE。与两个候选丰度都无关的"其余元素包络"只卷积一次并在全网格复用；第一元素的富集多项式在其外层丰度固定时只计算一次。MSE 相同按两项丰度（请求顺序）升序字典序取解，`search_points` 为两网格点数之积。
 - **分子式反推**：`POST /api/v1/formula-search`（`app/formula_search.py`）对 2～6 个不重复元素及各自 0～200 的计数闭区间做深度优先分支限界枚举。元素按单同位素质量从重到轻访问；在每个节点用后缀元素最小/最大可贡献质量（`suffix_min`/`suffix_max`）把当前元素的可行计数夹到整数窗口 ⌈…⌉～⌊…⌋ 并与 `[min_count, max_count]` 取交，窗口外的计数值累加为 `pruned_branches` 且不递归（含 1e-10 Da 浮点保护，叶节点再做一次窗口校验）。命中组成用 `ParsedFormula` 复用天然丰度卷积，基峰归一化后用 `pair_and_score` 与同样归一化的观测峰一对一配对，未匹配峰按零强度计入 MSE；候选按 (MSE, |质量误差|, 元素符号字典序分子式) 稳定排序取前 `max_results`，`total_hits` 返回未截断的命中总数。全零组成不命中；访问节点（根计 1）超过 100 万抛出 `SearchLimitExceeded` 由专用异常处理器转 422；无命中返回 200 空候选列表。
+- **质量轴校准**：`POST /api/v1/mass-calibrate`（`app/mass_calibration.py`）对 3～200 个校准点逐个复用 `parse_formula`、`parse_adduct`/`apply_adduct` 与 `(monoisotopic_mass − charge·mₑ)/|charge|` 电子质量规则求理论单同位素 m/z；非法分子式/加合物的点标记为无效（携带既有 `position` 错误）并保留在结果中、保持输入顺序。初模取全部"理论 m/z 不同"点对斜率 `(yⱼ−yᵢ)/(xⱼ−xᵢ)` 的中位数（偶数个取中间两数均值），截距取各点 `y − slope0·x` 的中位数；相对初模绝对残差 ppm（`(y − predicted)/predicted × 10⁶`）不超过 `tolerance_ppm` 的点为内点，内点再做一次普通最小二乘（`slope = Sxy/Sxx`、`intercept = ȳ − slope·x̄`）。无有效点对、内点少于 3 个或斜率（初模/精修）非正时抛 `CalibrationError` 转 422（错误码依次为 `no_valid_pairs`、`insufficient_inliers`、`non_positive_slope`）。响应逐点返回理论 m/z、相对**最终直线**的残差 ppm 与内点标记，待校正 m/z 用逆变换 `(mz − intercept)/slope` 按输入顺序返回。
 - **同位素数据**：`app/isotopes.py` 内置约 50 种常见元素的 AME/CIAAW 同位素质量与天然丰度，可按需扩充。
 - **持久化**：SQLite 存计算结果缓存（`envelope_cache`）与请求日志（`request_log`），schema 随服务启动自动创建。
